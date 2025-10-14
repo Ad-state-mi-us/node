@@ -99,7 +99,7 @@ ModuleCacheKey ModuleCacheKey::From(Local<Context> context,
                                     Local<String> specifier,
                                     Local<FixedArray> import_attributes) {
   CHECK_EQ(import_attributes->Length() % elements_per_attribute, 0);
-  Isolate* isolate = context->GetIsolate();
+  Isolate* isolate = Isolate::GetCurrent();
   std::size_t h1 = specifier->GetIdentityHash();
   size_t num_attributes = import_attributes->Length() / elements_per_attribute;
   ImportAttributeVector attributes;
@@ -144,12 +144,12 @@ ModuleWrap::ModuleWrap(Realm* realm,
                        Local<Object> context_object,
                        Local<Value> synthetic_evaluation_step)
     : BaseObject(realm, object),
+      url_(Utf8Value(realm->isolate(), url).ToString()),
       module_(realm->isolate(), module),
       module_hash_(module->GetIdentityHash()) {
   realm->env()->hash_to_module_map.emplace(module_hash_, this);
 
   object->SetInternalField(kModuleSlot, module);
-  object->SetInternalField(kURLSlot, url);
   object->SetInternalField(kModuleSourceObjectSlot,
                            v8::Undefined(realm->isolate()));
   object->SetInternalField(kSyntheticEvaluationStepsSlot,
@@ -757,24 +757,57 @@ void ModuleWrap::Evaluate(const FunctionCallbackInfo<Value>& args) {
   bool timed_out = false;
   bool received_signal = false;
   MaybeLocal<Value> result;
-  auto run = [&]() {
-    MaybeLocal<Value> result = module->Evaluate(context);
-    if (!result.IsEmpty() && microtask_queue)
+  {
+    auto wd = timeout != -1
+                  ? std::make_optional<Watchdog>(isolate, timeout, &timed_out)
+                  : std::nullopt;
+    auto swd = break_on_sigint ? std::make_optional<SigintWatchdog>(
+                                     isolate, &received_signal)
+                               : std::nullopt;
+
+    result = module->Evaluate(context);
+
+    Local<Value> res;
+    if (result.ToLocal(&res) && microtask_queue) {
+      DCHECK(res->IsPromise());
+
+      // To address https://github.com/nodejs/node/issues/59541 when the
+      // module has its own separate microtask queue in microtaskMode
+      // "afterEvaluate", we avoid returning a promise built inside the
+      // module's own context.
+      //
+      // Instead, we build a promise in the outer context, which we resolve
+      // with {result}, then we checkpoint the module's own queue, and finally
+      // we return the outer-context promise.
+      //
+      // If we simply returned the inner promise {result} directly, per
+      // https://tc39.es/ecma262/#sec-newpromiseresolvethenablejob, the outer
+      // context, when resolving a promise coming from a different context,
+      // would need to enqueue a task (known as a thenable job task) onto the
+      // queue of that different context (the module's context). But this queue
+      // will normally not be checkpointed after evaluate() returns.
+      //
+      // This means that the execution flow in the outer context would
+      // silently fall through at the statement (in lib/internal/vm/module.js):
+      //   await this[kWrap].evaluate(timeout, breakOnSigint)
+      //
+      // This is true for any promises created inside the module's context
+      // and made available to the outer context, as the node:vm doc explains.
+      //
+      // We must handle this particular return value differently to make it
+      // possible to await on the result of evaluate().
+      Local<Context> outer_context = isolate->GetCurrentContext();
+      Local<Promise::Resolver> resolver;
+      if (!Promise::Resolver::New(outer_context).ToLocal(&resolver)) {
+        result = {};
+      }
+      if (resolver->Resolve(outer_context, res).IsNothing()) {
+        result = {};
+      }
+      result = resolver->GetPromise();
+
       microtask_queue->PerformCheckpoint(isolate);
-    return result;
-  };
-  if (break_on_sigint && timeout != -1) {
-    Watchdog wd(isolate, timeout, &timed_out);
-    SigintWatchdog swd(isolate, &received_signal);
-    result = run();
-  } else if (break_on_sigint) {
-    SigintWatchdog swd(isolate, &received_signal);
-    result = run();
-  } else if (timeout != -1) {
-    Watchdog wd(isolate, timeout, &timed_out);
-    result = run();
-  } else {
-    result = run();
+    }
   }
 
   if (result.IsEmpty()) {
@@ -935,8 +968,7 @@ void ModuleWrap::GetModuleSourceObject(
       obj->object()->GetInternalField(kModuleSourceObjectSlot).As<Value>();
 
   if (module_source_object->IsUndefined()) {
-    Local<String> url = obj->object()->GetInternalField(kURLSlot).As<String>();
-    THROW_ERR_SOURCE_PHASE_NOT_DEFINED(isolate, url);
+    THROW_ERR_SOURCE_PHASE_NOT_DEFINED(isolate, obj->url_);
     return;
   }
 
@@ -989,7 +1021,7 @@ MaybeLocal<Module> ModuleWrap::ResolveModuleCallback(
     return {};
   }
   DCHECK_NOT_NULL(resolved_module);
-  return resolved_module->module_.Get(context->GetIsolate());
+  return resolved_module->module_.Get(Isolate::GetCurrent());
 }
 
 // static
@@ -1010,10 +1042,8 @@ MaybeLocal<Object> ModuleWrap::ResolveSourceCallback(
           ->GetInternalField(ModuleWrap::kModuleSourceObjectSlot)
           .As<Value>();
   if (module_source_object->IsUndefined()) {
-    Local<String> url = resolved_module->object()
-                            ->GetInternalField(ModuleWrap::kURLSlot)
-                            .As<String>();
-    THROW_ERR_SOURCE_PHASE_NOT_DEFINED(context->GetIsolate(), url);
+    THROW_ERR_SOURCE_PHASE_NOT_DEFINED(Isolate::GetCurrent(),
+                                       resolved_module->url_);
     return {};
   }
   CHECK(module_source_object->IsObject());
@@ -1026,7 +1056,7 @@ Maybe<ModuleWrap*> ModuleWrap::ResolveModule(
     Local<String> specifier,
     Local<FixedArray> import_attributes,
     Local<Module> referrer) {
-  Isolate* isolate = context->GetIsolate();
+  Isolate* isolate = Isolate::GetCurrent();
   Environment* env = Environment::GetCurrent(context);
   if (env == nullptr) {
     THROW_ERR_EXECUTION_ENVIRONMENT_NOT_AVAILABLE(isolate);
@@ -1045,17 +1075,21 @@ Maybe<ModuleWrap*> ModuleWrap::ResolveModule(
     return Nothing<ModuleWrap*>();
   }
   if (!dependent->IsLinked()) {
-    THROW_ERR_VM_MODULE_LINK_FAILURE(
-        env,
-        "request for '%s' is from a module not been linked",
-        cache_key.specifier);
+    THROW_ERR_VM_MODULE_LINK_FAILURE(env,
+                                     "request for '%s' can not be resolved on "
+                                     "module '%s' that is not linked",
+                                     cache_key.specifier,
+                                     dependent->url_);
     return Nothing<ModuleWrap*>();
   }
 
   auto it = dependent->resolve_cache_.find(cache_key);
   if (it == dependent->resolve_cache_.end()) {
     THROW_ERR_VM_MODULE_LINK_FAILURE(
-        env, "request for '%s' is not in cache", cache_key.specifier);
+        env,
+        "request for '%s' is not cached on module '%s'",
+        cache_key.specifier,
+        dependent->url_);
     return Nothing<ModuleWrap*>();
   }
 
@@ -1071,7 +1105,7 @@ static MaybeLocal<Promise> ImportModuleDynamicallyWithPhase(
     Local<String> specifier,
     ModuleImportPhase phase,
     Local<FixedArray> import_attributes) {
-  Isolate* isolate = context->GetIsolate();
+  Isolate* isolate = Isolate::GetCurrent();
   Environment* env = Environment::GetCurrent(context);
   if (env == nullptr) {
     THROW_ERR_EXECUTION_ENVIRONMENT_NOT_AVAILABLE(isolate);
@@ -1310,7 +1344,7 @@ MaybeLocal<Module> LinkRequireFacadeWithOriginal(
     Local<FixedArray> import_attributes,
     Local<Module> referrer) {
   Environment* env = Environment::GetCurrent(context);
-  Isolate* isolate = context->GetIsolate();
+  Isolate* isolate = Isolate::GetCurrent();
   CHECK(specifier->Equals(context, env->original_string()).ToChecked());
   CHECK(!env->temporary_required_module_facade_original.IsEmpty());
   return env->temporary_required_module_facade_original.Get(isolate);

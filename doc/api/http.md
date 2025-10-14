@@ -118,6 +118,7 @@ added: v0.3.4
 changes:
   - version:
     - v24.7.0
+    - v22.20.0
     pr-url: https://github.com/nodejs/node/pull/59315
     description: Add support for `agentKeepAliveTimeoutBuffer`.
   - version:
@@ -1671,7 +1672,7 @@ per connection (in the case of HTTP Keep-Alive connections).
 <!-- YAML
 added: v0.1.94
 changes:
-  - version: REPLACEME
+  - version: v24.9.0
     pr-url: https://github.com/nodejs/node/pull/59824
     description: Whether this event is fired can now be controlled by the
                  `shouldUpgradeCallback` and sockets will be destroyed
@@ -3555,6 +3556,9 @@ Found'`.
 added: v0.1.13
 changes:
   - version: REPLACEME
+    pr-url: https://github.com/nodejs/node/pull/59778
+    description: Add optimizeEmptyRequests option.
+  - version: v24.9.0
     pr-url: https://github.com/nodejs/node/pull/59824
     description: The `shouldUpgradeCallback` option is now supported.
   - version:
@@ -3658,6 +3662,11 @@ changes:
     using `; `.
   * `rejectNonStandardBodyWrites` {boolean} If set to `true`, an error is thrown
     when writing to an HTTP response which does not have a body.
+    **Default:** `false`.
+  * `optimizeEmptyRequests` {boolean} If set to `true`, requests without `Content-Length`
+    or `Transfer-Encoding` headers (indicating no body) will be initialized with an
+    already-ended body stream, so they will never emit any stream events
+    (like `'data'` or `'end'`). You can use `req.readableEnded` to detect this case.
     **Default:** `false`.
 
 * `requestListener` {Function}
